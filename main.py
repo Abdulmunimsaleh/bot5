@@ -1,7 +1,6 @@
 import os
-import time
-import google.generativeai as genai
-from dotenv import load_dotenv
+import pickle
+import asyncio
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from langchain.prompts import PromptTemplate
@@ -11,8 +10,9 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
-import asyncio
 from playwright.async_api import async_playwright
+import google.generativeai as genai
+from dotenv import load_dotenv
 
 # Load API Key
 load_dotenv()
@@ -28,6 +28,7 @@ app = FastAPI(title="Tripzoori AI Assistant API", description="API for answering
 
 # Website URL
 TRIPZOORI_URL = "https://tripzoori-gittest1.fly.dev/"
+VECTOR_STORE_PATH = "vector_store.pkl"
 
 # Function to Load and Process Website Content with Playwright
 async def load_website_content_async(url):
@@ -41,21 +42,26 @@ async def load_website_content_async(url):
             
             document = Document(page_content=content, metadata={"source": url})
             
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=30)  # Reduced chunk size
             document_chunks = text_splitter.split_documents([document])
             
             embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
             vector_store = FAISS.from_documents(document_chunks, embeddings)
             
+            # Save vector store to disk
+            with open(VECTOR_STORE_PATH, "wb") as f:
+                pickle.dump(vector_store, f)
+            
             return vector_store
     except Exception as e:
         raise Exception(f"Error fetching website content: {str(e)}")
 
-# Initialize vector store at startup
-@app.on_event("startup")
-async def startup_event():
-    global vector_store
-    vector_store = await load_website_content_async(TRIPZOORI_URL)
+# Function to Load Persisted Vector Store
+def load_vector_store():
+    if os.path.exists(VECTOR_STORE_PATH):
+        with open(VECTOR_STORE_PATH, "rb") as f:
+            return pickle.load(f)
+    return None
 
 # Prompt Template
 prompt = PromptTemplate(
@@ -90,8 +96,9 @@ class QueryRequest(BaseModel):
 @app.get("/ask")
 async def ask_tripzoori_get(question: str = Query(..., description="Question about Tripzoori")):
     try:
-        # Create retrieval chain only when needed
-        retrieval_chain = get_conversation_chain(vector_store)
+        vector_store = load_vector_store()
+        if not vector_store:
+            vector_store = await load_website_content_async(TRIPZOORI_URL)
         
         retrieved_docs = vector_store.similarity_search(question, k=3)
         context = "\n\n".join([doc.page_content for doc in retrieved_docs])
@@ -105,8 +112,9 @@ async def ask_tripzoori_get(question: str = Query(..., description="Question abo
 @app.post("/ask")
 async def ask_tripzoori(request: QueryRequest):
     try:
-        # Create retrieval chain only when needed
-        retrieval_chain = get_conversation_chain(vector_store)
+        vector_store = load_vector_store()
+        if not vector_store:
+            vector_store = await load_website_content_async(TRIPZOORI_URL)
         
         retrieved_docs = vector_store.similarity_search(request.question, k=3)
         context = "\n\n".join([doc.page_content for doc in retrieved_docs])
