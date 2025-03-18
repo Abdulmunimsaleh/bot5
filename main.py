@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from langchain.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.embeddings.huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 from playwright.async_api import async_playwright
 import google.generativeai as genai
@@ -59,15 +59,15 @@ async def load_website_content_async(url):
             document = Document(page_content=content, metadata={"source": url})
 
             # Memory-efficient text splitting
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=150, chunk_overlap=15)
             document_chunks = text_splitter.split_documents([document])
 
             # Use a lightweight embedding model
             embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-            vector_store = FAISS.from_documents(document_chunks[:50], embeddings)  # Process in batches
+            vector_store = FAISS.from_documents(document_chunks[:25], embeddings)  # Process in batches
 
-            for i in range(50, len(document_chunks), 50):
-                vector_store.add_documents(document_chunks[i:i + 50])
+            for i in range(25, len(document_chunks), 25):
+                vector_store.add_documents(document_chunks[i:i + 25])
 
             # Save vector store to disk
             with open(VECTOR_STORE_PATH, "wb") as f:
@@ -113,9 +113,21 @@ def cleanup_resources(*args):
         del obj
     gc.collect()
 
+# Monitor Memory Usage
+def log_memory_usage():
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / (1024 * 1024)
+    print(f"Memory Usage: {memory_mb:.2f} MB")
+
+    if memory_mb > 450:  # Warn if memory usage approaches the limit
+        print("WARNING: Memory usage is approaching the 512MB limit!")
+
 # GET API Endpoint
 @app.get("/ask", summary="Ask a question about Tripzoori")
 async def ask_tripzoori_get(question: str = Query(..., description="Question about Tripzoori")):
+    log_memory_usage()  # Log memory before processing
+
     try:
         vector_store = load_vector_store()
         if not vector_store:
@@ -126,8 +138,8 @@ async def ask_tripzoori_get(question: str = Query(..., description="Question abo
         final_prompt = prompt.format(context=context, input=question)
         response = generate_response(final_prompt)
 
-        # Cleanup resources
-        cleanup_resources(retrieved_docs, context)
+        cleanup_resources(retrieved_docs, context)  # Cleanup after processing
+        log_memory_usage()  # Log memory after processing
 
         return {"answer": response}
     except Exception as e:
@@ -136,6 +148,8 @@ async def ask_tripzoori_get(question: str = Query(..., description="Question abo
 # POST API Endpoint
 @app.post("/ask", summary="Ask a question about Tripzoori")
 async def ask_tripzoori(request: QueryRequest):
+    log_memory_usage()  # Log memory before processing
+
     try:
         vector_store = load_vector_store()
         if not vector_store:
@@ -146,8 +160,8 @@ async def ask_tripzoori(request: QueryRequest):
         final_prompt = prompt.format(context=context, input=request.question)
         response = generate_response(final_prompt)
 
-        # Cleanup resources
-        cleanup_resources(retrieved_docs, context)
+        cleanup_resources(retrieved_docs, context)  # Cleanup after processing
+        log_memory_usage()  # Log memory after processing
 
         return {"answer": response}
     except Exception as e:
@@ -165,12 +179,3 @@ async def startup_event():
     vector_store_cache = load_vector_store()
     if not vector_store_cache:
         vector_store_cache = await load_website_content_async(TRIPZOORI_URL)
-
-# Monitor Memory Usage
-def log_memory_usage():
-    process = psutil.Process()
-    memory_info = process.memory_info()
-    print(f"Memory Usage: {memory_info.rss / (1024 * 1024):.2f} MB")
-
-# Periodically log memory usage
-log_memory_usage()
