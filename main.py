@@ -6,13 +6,14 @@ from pydantic import BaseModel
 from langchain.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings  # Updated import
 from langchain_core.documents import Document
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from playwright.async_api import async_playwright
 import google.generativeai as genai
 from dotenv import load_dotenv
+import gc  # For garbage collection
 
 # Load API Key
 load_dotenv()
@@ -36,21 +37,29 @@ async def load_website_content_async(url):
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
-            await page.goto(url, wait_until="networkidle")
+            
+            # Set timeout to avoid hanging
+            await page.goto(url, wait_until="networkidle", timeout=30000)
             content = await page.content()
             await browser.close()
             
             document = Document(page_content=content, metadata={"source": url})
             
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=30)  # Reduced chunk size
+            # Memory efficient text splitting
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=30)
             document_chunks = text_splitter.split_documents([document])
             
+            # Use a smaller model for embeddings to reduce memory usage
             embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
             vector_store = FAISS.from_documents(document_chunks, embeddings)
             
             # Save vector store to disk
             with open(VECTOR_STORE_PATH, "wb") as f:
                 pickle.dump(vector_store, f)
+            
+            # Force garbage collection
+            del document, document_chunks
+            gc.collect()
             
             return vector_store
     except Exception as e:
@@ -59,8 +68,12 @@ async def load_website_content_async(url):
 # Function to Load Persisted Vector Store
 def load_vector_store():
     if os.path.exists(VECTOR_STORE_PATH):
-        with open(VECTOR_STORE_PATH, "rb") as f:
-            return pickle.load(f)
+        try:
+            with open(VECTOR_STORE_PATH, "rb") as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"Error loading vector store: {str(e)}")
+            return None
     return None
 
 # Prompt Template
@@ -78,48 +91,67 @@ prompt = PromptTemplate(
 
 # Function to Generate Responses using Gemini
 def generate_response(final_prompt):
-    model = genai.GenerativeModel("gemini-1.5-pro")
-    response = model.generate_content(final_prompt)
-    return response.text
-
-# Function to Create RAG Chain
-def get_conversation_chain(vector_store):
-    retriever = vector_store.as_retriever()
-    retrieval_chain = create_stuff_documents_chain(generate_response, prompt)
-    return create_retrieval_chain(retriever, retrieval_chain)
+    try:
+        model = genai.GenerativeModel("gemini-1.5-pro")
+        response = model.generate_content(final_prompt)
+        return response.text
+    except Exception as e:
+        return f"Error generating response: {str(e)}"
 
 # Request Model for API Input
 class QueryRequest(BaseModel):
     question: str
 
-# GET API Endpoint
-@app.get("/ask")
+# GET API Endpoint with clear parameter requirements
+@app.get("/ask", summary="Ask a question about Tripzoori")
 async def ask_tripzoori_get(question: str = Query(..., description="Question about Tripzoori")):
     try:
         vector_store = load_vector_store()
         if not vector_store:
             vector_store = await load_website_content_async(TRIPZOORI_URL)
         
-        retrieved_docs = vector_store.similarity_search(question, k=3)
+        # Reduce number of retrieved docs to save memory
+        retrieved_docs = vector_store.similarity_search(question, k=2)
         context = "\n\n".join([doc.page_content for doc in retrieved_docs])
         final_prompt = prompt.format(context=context, input=question)
         response = generate_response(final_prompt)
+        
+        # Force garbage collection
+        del retrieved_docs, context
+        gc.collect()
+        
         return {"answer": response}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # POST API Endpoint
-@app.post("/ask")
+@app.post("/ask", summary="Ask a question about Tripzoori")
 async def ask_tripzoori(request: QueryRequest):
     try:
         vector_store = load_vector_store()
         if not vector_store:
             vector_store = await load_website_content_async(TRIPZOORI_URL)
         
-        retrieved_docs = vector_store.similarity_search(request.question, k=3)
+        # Reduce number of retrieved docs to save memory
+        retrieved_docs = vector_store.similarity_search(request.question, k=2)
         context = "\n\n".join([doc.page_content for doc in retrieved_docs])
         final_prompt = prompt.format(context=context, input=request.question)
         response = generate_response(final_prompt)
+        
+        # Force garbage collection
+        del retrieved_docs, context
+        gc.collect()
+        
         return {"answer": response}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# Add a simple root endpoint to avoid 404 on /
+@app.get("/")
+async def root():
+    return {"message": "Welcome to Tripzoori AI Assistant API. Use /ask endpoint to ask questions."}
+
+# Add docs endpoints for better API documentation
+@app.get("/docs")
+async def get_docs():
+    return {"message": "API documentation is available at /docs"}
